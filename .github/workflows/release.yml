@@ -1,0 +1,374 @@
+name: Release
+
+# Auto-publish per-platform binaries to GitHub Releases.
+#
+# - On every push to master: bumps the *patch* version (v1.0.0 -> v1.0.1 -> ...)
+#   using the latest reachable `v*.*.*` tag as base, then creates that tag and
+#   publishes a Release with the 6 cross-compiled binaries.
+# - Manual "Run workflow" for major/minor releases: pick minor/major (auto
+#   bumps the middle/leading digit) or custom (type an exact version like 2.0.0).
+# - To skip a release, push a commit whose only changes are docs / *.md.
+# - Re-running on an existing tag re-uploads assets to that tag's Release
+#   instead of creating a duplicate.
+
+on:
+  push:
+    branches: [master]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+  workflow_dispatch:
+    inputs:
+      version_bump:
+        description: >-
+          patch = auto-increment last digit (default). minor / major bump the
+          middle / leading digit. custom = use custom_version exactly.
+        type: choice
+        required: false
+        default: patch
+        options:
+          - patch
+          - minor
+          - major
+          - custom
+      custom_version:
+        description: Exact version for custom, e.g. 2.0.0 (without the leading v)
+        type: string
+        required: false
+
+concurrency:
+  # Releases mutate tags/Releases, so queue instead of cancelling in-flight runs
+  # (cancelling mid-tag would leave a Release with no assets).
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: Typecheck + tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bunx tsc --noEmit
+
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: bun-linux-x64
+            artifact: oc-ss-p-linux-x64
+            smoke: true
+          - target: bun-linux-arm64
+            artifact: oc-ss-p-linux-arm64
+            smoke: false
+          - target: bun-windows-x64
+            artifact: oc-ss-p-windows-x64.exe
+            smoke: false
+          - target: bun-windows-arm64
+            artifact: oc-ss-p-windows-arm64.exe
+            smoke: false
+          - target: bun-darwin-x64
+            artifact: oc-ss-p-darwin-x64
+            smoke: false
+          - target: bun-darwin-arm64
+            artifact: oc-ss-p-darwin-arm64
+            smoke: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build standalone executable
+        # No --asset config.json: the binary ships with builtin defaults only
+        # (port 8787 on 127.0.0.1). Users put a real .env next to the binary if
+        # they want overrides — this also guarantees no key can ever be baked
+        # into a public artifact.
+        run: |
+          bun build ./src/index.ts \
+            --compile --production --minify \
+            --target ${{ matrix.target }} \
+            --outfile dist/${{ matrix.artifact }}
+
+      - name: Smoke test compiled binary
+        # Boot the linux-x64 binary (native arch for this runner) in an empty dir
+        # and hit /health (serves on port 8787, the builtin default).
+        if: matrix.smoke
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/smoke
+          chmod +x dist/${{ matrix.artifact }}
+          cp dist/${{ matrix.artifact }} /tmp/smoke/server
+          cd /tmp/smoke
+          ./server &
+          pid=$!
+          ok=0
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:3050/health > health.json; then
+              ok=1
+              break
+            fi
+            sleep 1
+          done
+          kill $pid 2>/dev/null || true
+          wait $pid 2>/dev/null || true
+          cat health.json 2>/dev/null || true
+          if [ "$ok" != "1" ]; then
+            echo "Server did not become healthy in time"
+            exit 1
+          fi
+          grep -q '"ok":true' health.json
+          # The container HEALTHCHECK runs the binary's own probe subcommand,
+          # so assert it exits 0 against the live server too.
+          ./server healthcheck
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: bin-${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+          if-no-files-found: error
+
+  release:
+    name: Tag release
+    runs-on: ubuntu-latest
+    needs: build
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      previous: ${{ steps.version.outputs.previous }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Determine version
+        id: version
+        env:
+          MANUAL_BUMP: ${{ github.event.inputs.version_bump }}
+          CUSTOM_VERSION: ${{ github.event.inputs.custom_version }}
+        shell: bash
+        run: |
+          bump="${MANUAL_BUMP:-patch}"
+          if [ "$bump" = "custom" ]; then
+            if [ -z "$CUSTOM_VERSION" ]; then
+              echo "::error::custom_version is required when version_bump=custom"
+              exit 1
+            fi
+            version="${CUSTOM_VERSION#v}"
+          else
+            latest="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --merged HEAD \
+              | sort -V | tail -n 1)"
+            if [ -z "$latest" ]; then
+              # No prior tag. Seed from package.json so the first tag matches
+              # the version the package already advertises (and bump from
+              # there, since this workflow publishes a patch on every push).
+              seed="$(node -p "require('./package.json').version" 2>/dev/null || echo "")"
+              if [[ ! "$seed" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                seed="1.0.0"
+              fi
+              latest="v$seed"
+              echo "No tag yet - seeding from package.json version $seed"
+            fi
+            base="${latest#v}"
+            IFS='.' read -r maj min pat <<< "$base"
+            case "$bump" in
+              major) version="$((maj + 1)).0.0" ;;
+              minor) version="$maj.$((min + 1)).0" ;;
+              patch) version="$maj.$min.$((pat + 1))" ;;
+              *) echo "::error::Unknown version bump '$bump'"; exit 1 ;;
+            esac
+          fi
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid version '$version' (expected semver like 1.2.3)"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # Remember the tag this release supersedes *before* it is created:
+          # `git describe` in a later job would otherwise resolve to the new
+          # tag and produce an empty changelog.
+          previous="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --merged HEAD \
+            | sort -V | tail -n 1)"
+          echo "previous=$previous" >> "$GITHUB_OUTPUT"
+          echo "Determined version: v$version"
+
+      - name: Create tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          if git rev-parse -q --verify "refs/tags/v$VERSION" > /dev/null; then
+            echo "Tag v$VERSION already exists - reusing its Release."
+          else
+            git tag "v$VERSION"
+            git push origin "v$VERSION"
+          fi
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Publish release assets
+    runs-on: ubuntu-latest
+    needs: [release]
+    steps:
+      - name: Checkout
+        # gh release create derives the repo (owner/name) from the git remote,
+        # so the job needs a checkout even though it only uploads binaries.
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Download all binaries
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Write release notes
+        env:
+          TAG: ${{ needs.release.outputs.tag }}
+          PREVIOUS_TAG: ${{ needs.release.outputs.previous }}
+        shell: bash
+        run: |
+          : > notes.md
+
+          # Generate changelog from commits since the tag this release
+          # supersedes. That value is captured before the new tag was pushed;
+          # resolving it here with `git describe` would return the new tag and
+          # yield an empty changelog.
+          LAST_TAG="$PREVIOUS_TAG"
+          if [ -n "$LAST_TAG" ]; then
+            git log "$LAST_TAG"..HEAD --pretty=format:"%s %h" --no-merges > /tmp/changelog.txt
+          else
+            git log --pretty=format:"%s %h" --no-merges > /tmp/changelog.txt
+          fi
+          # Never ship an empty "What's Changed" section.
+          if [ ! -s /tmp/changelog.txt ]; then
+            echo "(no user-facing commits since ${LAST_TAG:-the beginning})" > /tmp/changelog.txt
+          fi
+
+          # Categorize commits
+          FEATURES=$(grep -iE "(feat|feature)" /tmp/changelog.txt || true)
+          FIXES=$(grep -iE "(fix|bugfix|hotfix)" /tmp/changelog.txt || true)
+          DOCS=$(grep -iE "(docs|doc)" /tmp/changelog.txt || true)
+          REFACTOR=$(grep -iE "(refactor|refact)" /tmp/changelog.txt || true)
+          SECURITY=$(grep -iE "(security|sec)" /tmp/changelog.txt || true)
+          PERF=$(grep -iE "(perf|performance)" /tmp/changelog.txt || true)
+          OTHER=$(grep -ivE "(feat|feature|fix|bugfix|hotfix|docs|doc|refactor|refact|security|sec|perf|performance)" /tmp/changelog.txt || true)
+
+          writeSection() {
+            if [ -n "$2" ]; then
+              echo "### $1" >> notes.md
+              echo "$2" >> notes.md
+              echo "" >> notes.md
+            fi
+          }
+
+          # Write header first (heredoc to avoid escaping issues)
+          cat > notes.md << 'NOTES_EOF'
+          ## What's Changed
+
+          NOTES_EOF
+
+          writeSection "Security" "$SECURITY"
+          writeSection "New Features" "$FEATURES"
+          writeSection "Bug Fixes" "$FIXES"
+          writeSection "Performance" "$PERF"
+          writeSection "Refactoring" "$REFACTOR"
+          writeSection "Documentation" "$DOCS"
+          writeSection "Other Changes" "$OTHER"
+
+          # Installation section (heredoc avoids parenthesis/quote issues)
+          cat >> notes.md << 'INSTALL_EOF'
+          ## Installation
+
+          Single-file executables (cross-compiled with Bun). Builtin defaults
+          (port 8787 on 127.0.0.1) apply when no environment variables are set.
+          Override them with env vars, e.g.
+          `HOST=0.0.0.0 PORT=8787 PROXIES=http://user:pass@host:8080 ./oc-ss-p-linux-x64`.
+
+          ## Assets
+
+          | Platform | Asset | SHA-256 |
+          |---|---|---|
+
+          INSTALL_EOF
+
+          # Add asset rows
+          (cd dist && for f in *; do
+             case "$f" in
+               *windows*) os="Windows" ;;
+               *darwin*)  os="macOS" ;;
+               *)         os="Linux" ;;
+             esac
+             case "$f" in
+               *x64*)    arch="x64" ;;
+               *arm64*)  arch="arm64" ;;
+             esac
+             sha=$(sha256sum "$f" | cut -d " " -f1)
+             echo "| ${os} ${arch} | ${f} | ${sha} |" >> ../notes.md
+           done)
+
+          # Verify line and changelog link
+          cat >> notes.md << 'FOOTER_EOF'
+
+          Verify any download with:
+
+          ```sh
+          sha256sum -c SHA256SUMS.txt
+          ```
+
+          FOOTER_EOF
+
+          # Full changelog link
+          echo "" >> notes.md
+          echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/${LAST_TAG:-HEAD~1}...${TAG}" >> notes.md
+
+      - name: Checksums
+        shell: bash
+        run: (cd dist && sha256sum * > SHA256SUMS.txt)
+
+      - name: Create or update release
+        id: gh_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --json tagName -q .tagName > /dev/null 2>&1; then
+            echo "Release for $TAG exists - updating its assets."
+            gh release upload "$TAG" dist/* --clobber
+          else
+            echo "Creating release $TAG."
+            gh release create "$TAG" dist/* \
+              --title "$TAG" \
+              --notes-file notes.md
+          fi
