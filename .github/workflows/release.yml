@@ -115,35 +115,40 @@ jobs:
             --outfile dist/${{ matrix.artifact }}
 
       - name: Smoke test compiled binary
-        # Boot the linux-x64 binary (native arch for this runner) in an empty dir
-        # and hit /health (serves on port 8787, the builtin default).
+        # Boot the linux-x64 binary (native arch for this runner) in an empty
+        # dir, so it must come up on its builtin defaults: 127.0.0.1:8787
+        # (src/modules/proxy/service.ts, README, Dockerfile EXPOSE). Polling
+        # the default is deliberate - it proves the shipped artifact serves
+        # /health with no configuration present at all.
         if: matrix.smoke
         run: |
           set -euo pipefail
+          port=8787
           mkdir -p /tmp/smoke
           chmod +x dist/${{ matrix.artifact }}
           cp dist/${{ matrix.artifact }} /tmp/smoke/server
           cd /tmp/smoke
           ./server &
           pid=$!
+          # Stop the server on every exit path, including a failed assertion.
+          trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
           ok=0
           for i in $(seq 1 30); do
-            if curl -sf http://127.0.0.1:3050/health > health.json; then
+            if curl -sf "http://127.0.0.1:${port}/health" > health.json; then
               ok=1
               break
             fi
             sleep 1
           done
-          kill $pid 2>/dev/null || true
-          wait $pid 2>/dev/null || true
           cat health.json 2>/dev/null || true
           if [ "$ok" != "1" ]; then
-            echo "Server did not become healthy in time"
+            echo "Server did not become healthy on 127.0.0.1:${port} in time"
             exit 1
           fi
           grep -q '"ok":true' health.json
           # The container HEALTHCHECK runs the binary's own probe subcommand,
-          # so assert it exits 0 against the live server too.
+          # so assert it exits 0 against the live server too. The server is
+          # still up here; the trap above stops it once the step ends.
           ./server healthcheck
 
       - name: Upload binary artifact
