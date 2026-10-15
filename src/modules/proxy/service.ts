@@ -69,7 +69,9 @@ export abstract class ProxyService {
 			// Pinning a prefix is opt-in. Otherwise one is minted: per
 			// conversation by default, per request under ROTATE_SESSION_PREFIX.
 			sessionPrefix: raw.SESSION_PREFIX ?? null,
-			sessionCounter: Number(raw.SESSION_COUNTER ?? 7),
+			// 1 is what a freshly started client embeds for its first id in a
+			// millisecond; the counter occupies 12 bits, so 4095 is the ceiling.
+			sessionCounter: Number(raw.SESSION_COUNTER ?? 1),
 			rotateSessionPrefix:
 				raw.ROTATE_SESSION_PREFIX === "1" ||
 				raw.ROTATE_SESSION_PREFIX === "true",

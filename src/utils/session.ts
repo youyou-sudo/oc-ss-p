@@ -4,22 +4,23 @@
  * OpenCode's gateway expects requests that look like an OpenCode client,
  * and the session header must match
  *     ses_ + 12 hex + exactly 14 base62          (30 chars)
- * where the 12 hex encode a timestamp and a `counter` that must be 1..63
- * (a larger counter is rejected, and the timestamp bits are not checked).
+ * where the 12 hex are the low 48 bits of `~(Date.now() * 4096 + counter)`
+ * — the same descending encoding the official client uses, see
+ * `sessionPrefixFor` and OpenCode's `packages/schema/src/identifier.ts`.
  * new-api cannot compose such a value from configuration, so the value is
  * minted here. The 14 base62 chars identify the conversation, giving a
  * stable, distinct session per user/conversation.
  *
- * The prefix used by default is minted once per conversation, so the
- * timestamp inside it is the moment the conversation started rather than a
- * moment frozen into a constant months ago.
+ * The prefix is minted once per conversation, so the clock inside it is the
+ * moment the conversation started rather than a moment frozen months ago.
  */
 
 import { sessionPrefixFor } from "./fingerprint";
 
 // The constant prefix this proxy used to send for everyone. It is no longer
-// the default (prefixes are minted per conversation), but pinning it with
-// SESSION_PREFIX=ses_ecbe61115ffe restores the old behaviour.
+// the default: it is a real id captured on 2026-10-13, so its embedded clock
+// keeps ageing while the header stays frozen. Keep it only to reproduce the
+// old behaviour; prefer minting per conversation.
 export const DEFAULT_SESSION_PREFIX = "ses_ecbe61115ffe";
 
 // Kept for reference; the per-conversation fingerprint supplies the default
@@ -131,8 +132,8 @@ export function sessionModeOf(config: {
  * The prefix carries the start time of the session, and the gateway uses the
  * session for routing and prompt-cache affinity, so a conversation must keep
  * one session for its whole life while a new conversation must not reuse an
- * old timestamp. Entries expire so a long-lived process does not accumulate
- * one per conversation forever.
+ * old clock. Entries expire so a long-lived process does not accumulate one
+ * per conversation forever.
  */
 const PREFIX_TTL_MS = 12 * 60 * 60 * 1000;
 const PREFIX_CACHE_LIMIT = 4096;

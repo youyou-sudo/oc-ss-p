@@ -46,7 +46,8 @@ export const ProxyModel = {
 			t.String({ pattern: "^ses_[0-9a-f]{12}$" }),
 			t.Null(),
 		]),
-		sessionCounter: t.Integer({ minimum: 1, maximum: 63 }),
+		/** Per-millisecond id increment OpenCode embeds in the 12 hex chars. */
+		sessionCounter: t.Integer({ minimum: 1, maximum: 4095 }),
 		rotateSessionPrefix: t.Boolean(),
 		/** Fixed UA override, or null to use the per-conversation fingerprint. */
 		userAgent: t.Union([t.String(), t.Null()]),

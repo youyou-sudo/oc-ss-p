@@ -11,12 +11,24 @@ OpenCode 的网关只接受"看起来像 OpenCode 客户端"的请求，且会�
 ses_ + 12 位 hex + 恰好 14 位 base62          （共 30 字符）
 ```
 
-其中 12 位 hex 编码一个时间戳和一个必须为 `1..63` 的 `counter`。
-`new-api` 无法通过配置拼出这样的值，所以这里自行铸造：14 位 base62 用于标识
-会话，使每个用户/会话都拥有稳定且互不相同的 session。
+这 12 位 hex 不是随便填的十六进制，而是 OpenCode 自己那套 id 编码：
 
-> 12 位 hex 实际是 42 位时间戳 + 6 位 counter。完整的
-> `Date.now() * 4096 + counter` 需要 53 位，放不进 48 位。
+```
+current = Date.now() * 4096 + counter        // counter 是同毫秒内的自增序号
+value   = ~current                           // 取反（descending：越新越靠前）
+hex     = value 的低 48 位，大端，12 位
+```
+
+（见 anomalyco/opencode `packages/schema/src/identifier.ts`。）两个后果值得注意：
+
+- **id 是时钟的补码**。直接把时钟写进 hex（本代理早期就是这么做的）会铸出
+  一个"反着的"id：解出来 counter 变成 `4096 - counter`、时钟跑到几年之外。
+  网关只要解一次前缀就能看出这不是 OpenCode 发的会话。
+- 只有低 48 位会被保留，所以解出来的时钟是 `Date.now() mod 2^36`
+  —— 约 795 天一个循环的滚动窗口。
+
+`new-api` 无法通过配置拼出这样的值，所以这里按同一套算法自行铸造；14 位 base62
+用于标识会话，使每个用户/会话都拥有稳定且互不相同的 session。
 
 ## 使用
 
@@ -46,7 +58,7 @@ https://opencode.ai/inference  ->  http://127.0.0.1:8787/inference
 | `EGRESS_STRATEGY`        | `stable`               | `stable` / `round-robin` / `random`      |
 | `SESSION_PREFIX`         | _(按会话铸造)_         | 固定 12 位 hex 前缀（旧默认 `ses_ecbe61115ffe`） |
 | `ROTATE_SESSION_PREFIX`  | `false`                | 为每次请求铸造新前缀（建议别开）         |
-| `SESSION_COUNTER`        | `7`                    | 前缀内嵌的 counter（1..63）              |
+| `SESSION_COUNTER`        | `1`                    | 前缀内嵌的 counter（12 位，1..4095）     |
 | `USER_AGENT`             | _(按会话派生)_         | 固定 UA，取代指纹                        |
 | `CLIENT`                 | _(按会话派生)_         | 固定 `x-opencode-client`，取代指纹       |
 | `CANONICALIZE_PATHS`     | `true`                 | 把旧的无 family 推理路径改写到规范路径   |
@@ -105,7 +117,8 @@ PROXIES="http://user:pass@host1:8080#alpha,http://user:pass@host2:8080#beta"
 早期所有用户共用同一个 session 前缀、同一个 UA、同一个 client 标签——这比共用
 一个出口 IP 更像"自动化集群"。现在除非显式固定，以下三项都按会话派生：
 
-- 12 位 hex 前缀：按会话铸造一次，时间戳就是这段对话开始的时间。
+- 12 位 hex 前缀：按会话铸造一次，时钟就是这段对话开始的时间（按 OpenCode
+  的 descending 编码，解出来与真实客户端一致）。
 - session id 的 14 位后缀：按会话派生。
 - `user-agent` + `x-opencode-client`：按会话成对派生。
 
@@ -162,7 +175,9 @@ src
   `x-opencode-client`，以及调用方没带时的 `x-opencode-project`
   （40 位 hex，形如 git root commit）。
 - 每个对话的 12 位 hex 前缀只铸造一次并缓存 12 小时，因此同一对话在网关侧的
-  路由与 prompt cache 亲和性保持稳定，同时时间戳不会是几个月前的常量。
+  路由与 prompt cache 亲和性保持稳定，同时时钟不会是几个月前的常量。
+  `SESSION_PREFIX` 会把前缀冻住，注意它内嵌的时钟也会一起冻住（旧默认常量就是
+  2026-10-13 抓到的一个真实 id，会越来越"旧"）。
 - 上游的 `content-encoding` / `content-length` 会被丢弃：Bun 会透明解压响应体，
   若照搬这两个头，发给客户端的字节就会被错误标注。
 - 3xx 响应按原样转发（`redirect: "manual"`），由客户端决定是否跟随。

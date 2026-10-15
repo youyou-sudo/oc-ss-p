@@ -122,25 +122,39 @@ function suffixFromSeed(seed: string): string {
 	return out;
 }
 
-// 48 bits of budget in the 12 hex chars: 6 for the counter, 42 for the clock.
-const COUNTER_SHIFT = 6n;
-const TS_MASK = (1n << 42n) - 1n;
+const MASK_48 = (1n << 48n) - 1n;
 
 /**
- * Mints a session prefix whose counter is always a legal 1..63.
+ * Mints a session prefix exactly the way OpenCode does.
  *
- * The upstream format is `ses_ + 12 hex`, where the value is roughly
- * `Date.now() * 4096 + counter`. That product needs 53 bits and cannot fit
- * in 12 hex (48 bits), so the timestamp is kept to its low 42 bits and the
- * counter occupies the low 6. BigInt is required: 48 bits exceeds the
- * 32-bit range of Number bitwise operators.
+ * `packages/schema/src/identifier.ts` builds every id as
+ *
+ *     current = Date.now() * 4096 + counter      (counter: per-ms increment)
+ *     value   = ~current                         (descending: newest first)
+ *
+ * and prints the low 48 bits of `value` as 12 hex chars. Two consequences
+ * matter here:
+ *
+ * - The id is the *complement* of the clock. Writing the clock straight into
+ *   the hex (what this proxy used to do) mints ids whose bits are inverted:
+ *   decoding one yields the counter `4096 - counter` and a clock years away
+ *   from now, which a gateway that decodes the prefix to check the session
+ *   rejects.
+ * - Only the low 48 bits survive, so a decoded id carries
+ *   `Date.now() mod 2^36` — a rolling window of roughly 795 days.
+ *
+ * BigInt is required: 48 bits exceeds the 32-bit range of Number bitwise
+ * operators.
  */
 export function sessionPrefixFor(counter: number, now = Date.now()): string {
-	const clamped = Math.min(63, Math.max(1, Math.trunc(counter)));
-	const clock = BigInt(now) & TS_MASK;
-	const value = (clock << COUNTER_SHIFT) + BigInt(clamped);
-	return "ses_" + value.toString(16).padStart(12, "0");
+	const clamped = Math.min(
+		MAX_COUNTER,
+		Math.max(MIN_COUNTER, Math.trunc(counter)),
+	);
+	const value = ~(BigInt(now) * 0x1000n + BigInt(clamped));
+	return "ses_" + (value & MASK_48).toString(16).padStart(12, "0");
 }
 
-export const MAX_COUNTER = 63;
+/** The counter occupies 12 bits: the per-millisecond id increment. */
+export const MAX_COUNTER = 4095;
 export const MIN_COUNTER = 1;
