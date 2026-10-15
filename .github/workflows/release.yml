@@ -310,7 +310,10 @@ jobs:
           writeSection "Documentation" "$DOCS"
           writeSection "Other Changes" "$OTHER"
 
-          # Installation section (heredoc avoids parenthesis/quote issues)
+          # Installation section (heredoc avoids parenthesis/quote issues). The
+          # delimiter row must be the last line of this heredoc: the asset rows
+          # are appended immediately below, and a blank line in between would
+          # end the table (leaving the header rendered on its own).
           cat >> notes.md << 'INSTALL_EOF'
           ## Installation
 
@@ -323,7 +326,6 @@ jobs:
 
           | Platform | Asset | SHA-256 |
           |---|---|---|
-
           INSTALL_EOF
 
           # Add asset rows
