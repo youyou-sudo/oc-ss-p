@@ -13,17 +13,25 @@ import { EgressSelector, parseProxies } from "../../utils/egress";
 import {
 	clientFromUserAgent,
 	fingerprintFor,
-	projectFor,
 	sessionPrefixFor,
 	userAgentFor,
 } from "../../utils/fingerprint";
 import { canonicalPath } from "../../utils/upstream";
+import {
+	isZenFreeModel,
+	zenFreePath,
+	zenFreeRequestBody,
+	zenFreeStreamFilter,
+	ZEN_TOOL_SCHEMAS,
+	ZEN_TOOL_STUB_DESCRIPTION,
+	ZEN_TOOLS,
+} from "../../utils/zen";
 
 /** Per-conversation identity chosen for one request. */
 interface Identity {
 	seed: string;
 	session: string;
-	project: string;
+	request: string;
 	userAgent: string;
 	client: string;
 }
@@ -98,7 +106,7 @@ export abstract class ProxyService {
 	}
 
 	/**
-	 * Resolves the identity for one conversation: session id, project id,
+	 * Resolves the identity for one conversation: session id, request id,
 	 * user-agent and client tag.
 	 *
 	 * A pinned USER_AGENT and a pinned CLIENT are kept consistent with each
@@ -138,7 +146,9 @@ export abstract class ProxyService {
 		return {
 			seed,
 			session: sessionFor(prefix, fingerprint.sessionSuffix),
-			project: projectFor(fingerprint.sessionSuffix),
+			// One per request, as the client does: `msg_` + an ascending
+			// clock id (magpie, provider.openCodeNewID).
+			request: turnRequestID(),
 			userAgent:
 				config.userAgent ??
 				(callerClient ? callerAgent : userAgentFor(fingerprint.version, client)),
@@ -149,6 +159,12 @@ export abstract class ProxyService {
 	/**
 	 * Forwards a request to the upstream, injecting the identity headers an
 	 * OpenCode client sends plus a canonical request path.
+	 *
+	 * A request to one of OpenCode Zen's free models goes out as OpenCode
+	 * itself sends one (magpie's gateway/zenfree.go): at the inference API's
+	 * URL, streamed, offering tools named bash and read, and with the
+	 * model's calls of the client's own tools renamed back on the way
+	 * through.
 	 *
 	 * Returns the upstream Response untouched (minus hop-by-hop and
 	 * content-encoding headers) so status, streaming, and SSE all pass
@@ -182,35 +198,56 @@ export abstract class ProxyService {
 			headers.delete(name);
 		}
 
+		const bodyText = rawBody?.toString("utf8") ?? "";
 		const identity = ProxyService.identity(
 			Object.fromEntries(headers.entries()),
-			rawBody?.toString("utf8") ?? "",
+			bodyText,
 			config,
 		);
 		const { session } = identity;
-		// Spell the session the way the OpenCode client spells it:
-		// `x-opencode-session` and `x-session-affinity` carry the session
-		// affinity used for routing and prompt-cache keys, `x-opencode-session-id`
-		// carries the session itself, and `X-Session-Id` mirrors it for the
-		// providers that read that name.
+
+		// A request to one of Zen's free models is translated.
+		let model = "";
+		try {
+			model = String(
+				(JSON.parse(bodyText) as { model?: unknown }).model ?? "",
+			);
+		} catch {
+			// Not JSON, or no model: not a free-model request.
+		}
+		const free = isZenFreeModel(model);
+
+		// Spell the identity the way the OpenCode client spells it (magpie,
+		// provider.OpenCodeClient): the session in x-opencode-session and
+		// x-opencode-session-id, the turn in x-opencode-request. OpenCode
+		// 1.19.0 sends Zen neither x-session-affinity nor X-Session-Id, and
+		// since mid-October 2026 Zen's free tier answers 403 FreeTierError to
+		// a request carrying x-session-affinity, so neither goes.
 		headers.set("x-opencode-session", session);
 		headers.set("x-opencode-session-id", session);
-		headers.set("x-session-affinity", session);
-		headers.set("X-Session-Id", session);
+		headers.set("x-opencode-request", identity.request);
+		headers.delete("x-session-affinity");
+		headers.delete("X-Session-Id");
 		headers.set("x-opencode-client", identity.client);
-		// Project ids belong to the caller (a git root commit, `host/path`, or
-		// `"global"`), so only supply one when the caller sent none.
-		if (!headers.has("x-opencode-project"))
-			headers.set("x-opencode-project", identity.project);
+		// OpenCode's project outside a git repository is `global`, and Zen
+		// reads the project as OpenCode lays one out.
+		headers.set("x-opencode-project", "global");
 		if (!/^opencode\//.test(headers.get("user-agent") ?? ""))
 			headers.set("user-agent", identity.userAgent);
 
 		const url = new URL(request.url);
-		const target = canonicalPath(url.pathname, config.canonicalizePaths);
+		const canonical = canonicalPath(url.pathname, config.canonicalizePaths);
+		// Zen's free tier answers at the inference API's URL alone (magpie,
+		// provider.OpenCodeFreeURL): /zen/... -> /inference/....
+		const zen = free ? zenFreePath(canonical.path) : { path: canonical.path };
+		const target = {
+			path: zen.path,
+			rewrittenFrom: zen.rewrittenFrom ?? canonical.rewrittenFrom,
+		};
 		const hop = egress.pick(identity.seed);
 		if (config.verbose)
 			console.log(
-				`${request.method} ${url.pathname}${target.rewrittenFrom ? ` -> ${target.path}` : ""} -> ${session} via ${hop?.label ?? hop?.url ?? "direct"}`,
+				`${request.method} ${url.pathname}${target.rewrittenFrom ? ` -> ${target.path}` : ""} -> ${session} via ${hop?.label ?? hop?.url ?? "direct"}${free ? " (zen free)" : ""}`,
 			);
 
 		let upstream: Response;
@@ -218,7 +255,9 @@ export abstract class ProxyService {
 			upstream = await fetch(config.upstream + target.path + url.search, {
 				method: request.method,
 				headers,
-				body: rawBody,
+				body: hasBody
+					? Buffer.from(free ? zenFreeRequestBody(bodyText) : bodyText, "utf8")
+					: undefined,
 				redirect: "manual",
 				...(hop ? { proxy: hop.url } : {}),
 			});
@@ -234,9 +273,126 @@ export abstract class ProxyService {
 			responseHeaders.delete(name);
 		}
 
-		return new Response(upstream.body, {
+		if (!free || !upstream.body) {
+			return new Response(upstream.body, {
+				status: upstream.status,
+				headers: responseHeaders,
+			});
+		}
+
+		// The reply comes back in the free tier's vocabulary: tool-call names
+		// go back under the client's own, calls of an injected stub are
+		// dropped, and a turn that called nothing but a stub ends on a stop.
+		const { back, stubs } = zenFreeBookkeeping(bodyText);
+		if (back.size === 0 && stubs.size === 0) {
+			return new Response(upstream.body, {
+				status: upstream.status,
+				headers: responseHeaders,
+			});
+		}
+		const filter = zenFreeStreamFilter(back, stubs);
+		const stream = upstream.body
+			.pipeThrough(new TextDecoderStream())
+			.pipeThrough(sseTransform(filter))
+			.pipeThrough(new TextEncoderStream());
+		return new Response(stream, {
 			status: upstream.status,
 			headers: responseHeaders,
 		});
 	}
 }
+
+/**
+ * Reads which of the client's tools the free tier saw under a renamed or
+ * stubbed name, from the request as the client sent it (before
+ * zenFreeRequestBody translated it): a name offered under the lowercase
+ * one maps back to the client's, and the injected stubs are named here.
+ */
+function zenFreeBookkeeping(rawBody: string): {
+	back: Map<string, string>;
+	stubs: Set<string>;
+} {
+	const back = new Map<string, string>();
+	const stubs = new Set<string>();
+	let tools: unknown[];
+	try {
+		const parsed = JSON.parse(rawBody) as { tools?: unknown };
+		if (!Array.isArray(parsed.tools)) return { back, stubs };
+		tools = parsed.tools;
+	} catch {
+		return { back, stubs };
+	}
+	const seen = new Set(
+		tools
+			.map((t) => (t as { function?: { name?: unknown }; name?: unknown }))
+			.map((t) =>
+				typeof t?.name === "string"
+					? t.name
+					: typeof t?.function?.name === "string"
+						? t.function.name
+						: "",
+			)
+			.filter(Boolean),
+	);
+	for (const need of ZEN_TOOLS) {
+		if (seen.has(need)) continue;
+		const folded = [...seen].find((n) => n.toLowerCase() === need);
+		if (folded) back.set(need, folded);
+		else stubs.add(need);
+	}
+	return { back, stubs };
+}
+
+/**
+ * An SSE transform that runs chunkFilter over each `data:` payload. The
+ * upstream sends one event per write, so line-oriented splitting keeps the
+ * stream intact for anything this does not rewrite.
+ */
+function sseTransform(
+	chunkFilter: (chunk: Record<string, unknown>) => Record<string, unknown> | null,
+): TransformStream<string, string> {
+	let buffer = "";
+	return new TransformStream<string, string>({
+		transform(part, controller) {
+			buffer += part;
+			const lines = buffer.split("\n");
+			buffer = lines.pop() ?? "";
+			for (const line of lines) controller.enqueue(rewriteLine(line, chunkFilter));
+		},
+		flush(controller) {
+			if (buffer) controller.enqueue(rewriteLine(buffer, chunkFilter));
+		},
+	});
+}
+
+function rewriteLine(
+	line: string,
+	chunkFilter: (chunk: Record<string, unknown>) => Record<string, unknown> | null,
+): string {
+	const trimmed = line.trim();
+	if (!trimmed.startsWith("data:")) return line;
+	const data = trimmed.slice(5).trim();
+	if (!data || data === "[DONE]") return line;
+	try {
+		const chunk = JSON.parse(data) as Record<string, unknown>;
+		return `data: ${JSON.stringify(chunkFilter(chunk))}\n`;
+	} catch {
+		return line;
+	}
+}
+
+/** Builds the per-turn `msg_` id OpenCode sends as x-opencode-request. */
+function turnRequestID(): string {
+	const now = Date.now();
+	const value = BigInt(now) * 0x1000n + 1n;
+	const hex = (value & ((1n << 48n) - 1n)).toString(16).padStart(12, "0");
+	const B62 =
+		"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+	let suffix = "";
+	for (let i = 0; i < 14; i++)
+		suffix += B62[Math.floor(Math.random() * B62.length)];
+	return `msg_${hex}${suffix}`;
+}
+
+// Re-exported so the stub schemas stay reachable from tests.
+export { ZEN_TOOL_SCHEMAS, ZEN_TOOL_STUB_DESCRIPTION, ZEN_TOOLS };

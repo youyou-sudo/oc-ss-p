@@ -93,6 +93,24 @@ POST /zen/go/v1/chat/completions -> /go/openai/v1/chat/completions
 `/inference/v1/models` 是文档公布的模型列表端点，**不改写**；已经是规范路径的请求
 原样通过。设 `CANONICALIZE_PATHS=0` 可整体关闭。
 
+## Zen 免费模型（参照 magpie 的 gateway/zenfree.go）
+
+OpenCode Zen 的免费模型（id 以 `-free` 结尾，另有 `big-pickle`、`grok-code`）只对
+"看起来像 OpenCode 客户端"的请求应答。本代理对这类请求自动做四件事：
+
+1. **URL 重写**：`/zen/...` → `/inference/...`。2026-10 之后 Zen 对免费模型在
+   `/zen/v1` 一律 403 FreeTierError，同样的请求发到 `/inference/v1` 就是 200。
+2. **强制流式**：请求体 `stream` 置为 `true`（免费层只应答流式请求）。
+3. **注入工具**：请求里补上 `bash` 和 `read` 两个工具（带 OpenCode 自己的参数
+   schema；没有参数的空 schema 也会被拒）。客户端已有的大小写不同版本
+   （如 Claude Code 的 `Bash`/`Read`）改名为小写提供，模型的调用在响应流里
+   改回客户端自己的名字；客户端没有的以 stub 形式提供（描述为"永远不要调用"），
+   模型对 stub 的调用从响应流中丢弃。
+4. **匿名密钥**：免费模型用 `Authorization: Bearer public`（OpenCode 未登录时
+   用的匿名 key）即可，调用方自己的 key 原样保留。
+
+非免费模型完全不走这条管线：路径、流式、工具都原样转发。
+
 ## 出口代理（隐藏本机 IP）
 
 opencode 看到的是**出站**连接方的 IP。要隐藏本机 IP，就把上游流量交给代理池：
@@ -122,10 +140,10 @@ PROXIES="http://user:pass@host1:8080#alpha,http://user:pass@host2:8080#beta"
 - session id 的 14 位后缀：按会话派生。
 - `user-agent` + `x-opencode-client`：按会话成对派生。
 
-**UA 和 client 标签是一对，不能各自随机。** OpenCode 的写法是
+**UA 和 client 标签是一对，不能各自随机。** OpenCode 1.19.0 的写法是
 
 ```
-user-agent:        opencode/<channel>/<version>/<name>
+user-agent:        opencode/<version>/<name> ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14
 x-opencode-client: <name>
 ```
 
@@ -192,4 +210,3 @@ src
   客户端行为（工具清单、agent 形态、登录态）而不是单个请求头。本代理能修正
   指纹不自洽、路径过期、身份头缺失这些问题，但**不保证**能通过风控；要稳定使用
   请走付费（Go/Zen）或自带 key。
-

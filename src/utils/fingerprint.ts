@@ -21,19 +21,21 @@
 
 /** Recent OpenCode releases; an old version is a staleness signal of its own. */
 export const CLIENT_VERSIONS = [
-	"2.0.29",
-	"2.0.28",
-	"2.0.27",
-	"2.0.26",
-	"2.0.25",
-	"2.0.24",
+	"1.19.0",
+	"1.18.1",
+	"1.18.0",
 ] as const;
+
+/**
+ * OpenCode's own user-agent tail (1.19.0, captured from the real client):
+ * Zen's free tier turns away anything older than 1.18.0 with 426, and the
+ * gateway reads the ai-sdk and runtime segments too.
+ */
+export const CLIENT_AGENT_TAIL =
+	"ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14" as const;
 
 /** App names OpenCode reports in `x-opencode-client` and in the UA tail. */
 export const CLIENT_TAGS = ["cli", "cli", "cli", "cli", "desktop"] as const;
-
-/** Release channel OpenCode embeds in the user-agent. */
-export const CLIENT_CHANNEL = "latest";
 
 const B62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
@@ -76,9 +78,13 @@ export function fingerprintFor(seed: string): Fingerprint {
 	};
 }
 
-/** Builds the user-agent OpenCode pairs with `x-opencode-client: <client>`. */
+/**
+ * Builds the user-agent OpenCode pairs with `x-opencode-client: <client>`.
+ * The real client spells it `opencode/<version> <ai-sdk tail>`, so the
+ * version carries the app name the way OpenCode 1.19.0 sends it.
+ */
 export function userAgentFor(version: string, client: string): string {
-	return `opencode/${CLIENT_CHANNEL}/${version}/${client}`;
+	return `opencode/${version}/${client} ${CLIENT_AGENT_TAIL}`;
 }
 
 /**
@@ -89,7 +95,7 @@ export function userAgentFor(version: string, client: string): string {
 export function clientFromUserAgent(
 	userAgent: string | null | undefined,
 ): string | undefined {
-	const match = /^opencode\/[^/\s]+\/[^/\s]+\/([^/\s]+)$/.exec(
+	const match = /^opencode\/[^/\s]+\/([^/\s]+)/.exec(
 		(userAgent ?? "").trim(),
 	);
 	return match?.[1];
