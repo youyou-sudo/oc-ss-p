@@ -1,27 +1,39 @@
 /**
  * Utility: per-conversation client fingerprints.
  *
- * Every user behind one proxy previously shared the same three signals:
- * a constant session prefix, a constant user-agent, and a constant client
+ * Every conversation behind one proxy used to share the same three signals:
+ * a constant session prefix, a constant user-agent and a constant client
  * tag. That is a far stronger "this is an automated cluster" signal than a
- * single shared exit IP, so each signal is derived per conversation
- * instead of being hard-coded.
+ * single shared exit IP, so each signal is derived per conversation instead
+ * of being hard-coded.
+ *
+ * OpenCode spells one identity across two headers, and the two have to
+ * agree (`packages/core/src/app.ts` `useragent()` and
+ * `packages/core/src/session/model-request.ts` in anomalyco/opencode):
+ *
+ *     user-agent:        opencode/<channel>/<version>/<name>
+ *     x-opencode-client: <name>
+ *
+ * Deriving the two independently is what produced impossible pairs such as
+ * `opencode/latest/2.0.22/cli-darwin` next to `x-opencode-client: desktop`
+ * — OpenCode never appends a platform suffix to the app name.
  */
 
-/** Plausible OpenCode CLI versions. Kept close to real releases. */
+/** Recent OpenCode releases; an old version is a staleness signal of its own. */
 export const CLIENT_VERSIONS = [
-	"2.0.23",
-	"2.0.22",
-	"2.0.21",
-	"2.0.19",
-	"2.0.17",
+	"2.0.29",
+	"2.0.28",
+	"2.0.27",
+	"2.0.26",
+	"2.0.25",
+	"2.0.24",
 ] as const;
 
-/** Client tags OpenCode sends in `x-opencode-client`. */
-export const CLIENT_TAGS = ["cli", "cli", "cli", "server", "desktop"] as const;
+/** App names OpenCode reports in `x-opencode-client` and in the UA tail. */
+export const CLIENT_TAGS = ["cli", "cli", "cli", "cli", "desktop"] as const;
 
-/** Platform-ish suffixes seen on OpenCode's other transports. */
-const CLIENT_FLAVOURS = ["", "", "", "-darwin", "-linux"] as const;
+/** Release channel OpenCode embeds in the user-agent. */
+export const CLIENT_CHANNEL = "latest";
 
 const B62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
@@ -37,6 +49,8 @@ function bucket(seed: string, length: number): number {
 export interface Fingerprint {
 	/** 14 base62 chars appended to the session prefix. */
 	sessionSuffix: string;
+	/** Version segment of the user-agent. */
+	version: string;
 	/** Value for `user-agent`. */
 	userAgent: string;
 	/** Value for `x-opencode-client`. */
@@ -51,16 +65,46 @@ export interface Fingerprint {
 export function fingerprintFor(seed: string): Fingerprint {
 	const version = CLIENT_VERSIONS[bucket(`ver:${seed}`, CLIENT_VERSIONS.length)];
 	const client = CLIENT_TAGS[bucket(`cli:${seed}`, CLIENT_TAGS.length)];
-	const flavour =
-		CLIENT_FLAVOURS[bucket(`flav:${seed}`, CLIENT_FLAVOURS.length)];
 
 	return {
 		// Reuse the same hash primitive as the session suffix so the two
 		// stay internally consistent without a second hashing scheme.
 		sessionSuffix: suffixFromSeed(`fp:${seed}`),
-		userAgent: `opencode/latest/${version}/cli${flavour}`,
+		version,
+		userAgent: userAgentFor(version, client),
 		client,
 	};
+}
+
+/** Builds the user-agent OpenCode pairs with `x-opencode-client: <client>`. */
+export function userAgentFor(version: string, client: string): string {
+	return `opencode/${CLIENT_CHANNEL}/${version}/${client}`;
+}
+
+/**
+ * Reads the app name back out of an OpenCode user-agent, so a pinned or
+ * pass-through user-agent still yields an `x-opencode-client` that matches
+ * it. Returns undefined for anything that is not an OpenCode user-agent.
+ */
+export function clientFromUserAgent(
+	userAgent: string | null | undefined,
+): string | undefined {
+	const match = /^opencode\/[^/\s]+\/[^/\s]+\/([^/\s]+)$/.exec(
+		(userAgent ?? "").trim(),
+	);
+	return match?.[1];
+}
+
+/**
+ * Project ids are client-owned: a git root commit, `host/path`, or
+ * `"global"`. A stable 40-hex value keeps the header present in a shape
+ * OpenCode already sends instead of inventing a new one.
+ */
+export function projectFor(seed: string): string {
+	return Array.from(new Bun.CryptoHasher("sha256").update(`prj:${seed}`).digest())
+		.map((byte) => byte.toString(16).padStart(2, "0"))
+		.join("")
+		.slice(0, 40);
 }
 
 /**
@@ -91,13 +135,12 @@ const TS_MASK = (1n << 42n) - 1n;
  * counter occupies the low 6. BigInt is required: 48 bits exceeds the
  * 32-bit range of Number bitwise operators.
  */
-export function sessionPrefixFor(counter: number): string {
+export function sessionPrefixFor(counter: number, now = Date.now()): string {
 	const clamped = Math.min(63, Math.max(1, Math.trunc(counter)));
-	const clock = BigInt(Date.now()) & TS_MASK;
+	const clock = BigInt(now) & TS_MASK;
 	const value = (clock << COUNTER_SHIFT) + BigInt(clamped);
 	return "ses_" + value.toString(16).padStart(12, "0");
 }
 
 export const MAX_COUNTER = 63;
 export const MIN_COUNTER = 1;
-

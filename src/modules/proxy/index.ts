@@ -2,6 +2,7 @@ import { Elysia } from "elysia";
 
 import { ProxyService } from "./service";
 import { EgressSelector } from "../../utils/egress";
+import { sessionModeOf } from "../../utils/session";
 
 // Controller: one Elysia instance routes and validates HTTP concerns only.
 const config = ProxyService.config();
@@ -27,7 +28,13 @@ export const proxy = new Elysia()
 	.get("/", () => ({
 		service: "opencode-session-proxy",
 		upstream: config.upstream,
-		sessionPrefix: config.rotateSessionPrefix ? "rotating" : config.sessionPrefix,
+		session: {
+			mode: sessionModeOf(config),
+			prefix: config.sessionPrefix,
+		},
+		paths: {
+			canonicalize: config.canonicalizePaths,
+		},
 		egress: {
 			proxies: config.proxies.length,
 			strategy: config.egressStrategy,

@@ -1,6 +1,7 @@
 import { Elysia } from "elysia";
 
 import { proxy, proxyConfig } from "./modules/proxy";
+import { sessionModeOf } from "./utils/session";
 
 /**
  * Self-contained healthcheck used by the container HEALTHCHECK (the distroless
@@ -44,8 +45,13 @@ if (proxyConfig.proxies.length > 0)
 else console.log("   egress direct (set PROXIES to route through an upstream proxy)");
 if (!proxyConfig.userAgent || !proxyConfig.client)
 	console.log("   fingerprint: per-conversation user-agent + client tag");
+const sessionMode = sessionModeOf(proxyConfig);
 console.log(
-	proxyConfig.rotateSessionPrefix
-		? `   session prefix rotating (counter = ${proxyConfig.sessionCounter})`
-		: `   session prefix ${proxyConfig.sessionPrefix} (fixed)`,
+	sessionMode === "fixed"
+		? `   session prefix ${proxyConfig.sessionPrefix} (fixed)`
+		: sessionMode === "per-request"
+			? `   session prefix minted per request (counter = ${proxyConfig.sessionCounter})`
+			: `   session prefix minted per conversation (counter = ${proxyConfig.sessionCounter})`,
 );
+if (proxyConfig.canonicalizePaths)
+	console.log("   paths canonicalized (e.g. /inference/v1/chat/completions -> /inference/openai/v1/chat/completions)");

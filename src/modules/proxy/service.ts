@@ -4,17 +4,26 @@ import { env, status } from "elysia";
 
 import { ProxyModel } from "./model";
 import {
+	conversationPrefixFor,
 	conversationSeedOf,
-	DEFAULT_SESSION_PREFIX,
 	sessionFor,
+	sessionModeOf,
 } from "../../utils/session";
 import { EgressSelector, parseProxies } from "../../utils/egress";
-import { fingerprintFor, sessionPrefixFor } from "../../utils/fingerprint";
+import {
+	clientFromUserAgent,
+	fingerprintFor,
+	projectFor,
+	sessionPrefixFor,
+	userAgentFor,
+} from "../../utils/fingerprint";
+import { canonicalPath } from "../../utils/upstream";
 
 /** Per-conversation identity chosen for one request. */
 interface Identity {
 	seed: string;
 	session: string;
+	project: string;
 	userAgent: string;
 	client: string;
 }
@@ -39,6 +48,7 @@ export abstract class ProxyService {
 			"ROTATE_SESSION_PREFIX",
 			"USER_AGENT",
 			"CLIENT",
+			"CANONICALIZE_PATHS",
 			"VERBOSE",
 		] as const) {
 			const value = env[key];
@@ -56,14 +66,9 @@ export abstract class ProxyService {
 			upstream: (raw.UPSTREAM ?? "https://opencode.ai").replace(/\/+$/, ""),
 			port: Number(raw.PORT ?? 8787),
 			host: raw.HOST ?? "127.0.0.1",
-			// Rotating prefixes and per-conversation fingerprints are opt-out,
-			// so an existing SESSION_PREFIX/USER_AGENT/CLIENT setup keeps working.
-			sessionPrefix:
-				raw.SESSION_PREFIX ??
-				(raw.ROTATE_SESSION_PREFIX === "1" ||
-				raw.ROTATE_SESSION_PREFIX === "true"
-					? null
-					: DEFAULT_SESSION_PREFIX),
+			// Pinning a prefix is opt-in. Otherwise one is minted: per
+			// conversation by default, per request under ROTATE_SESSION_PREFIX.
+			sessionPrefix: raw.SESSION_PREFIX ?? null,
 			sessionCounter: Number(raw.SESSION_COUNTER ?? 7),
 			rotateSessionPrefix:
 				raw.ROTATE_SESSION_PREFIX === "1" ||
@@ -72,6 +77,10 @@ export abstract class ProxyService {
 			client: raw.CLIENT ?? null,
 			proxies: raw.PROXIES ? parseProxies(raw.PROXIES) : [],
 			egressStrategy: raw.EGRESS_STRATEGY ?? "stable",
+			// On by default: it is a no-op for callers that already send a
+			// family-scoped path, and it keeps legacy callers working.
+			canonicalizePaths:
+				raw.CANONICALIZE_PATHS !== "0" && raw.CANONICALIZE_PATHS !== "false",
 			verbose: raw.VERBOSE === "1" || raw.VERBOSE === "true",
 		};
 
@@ -87,9 +96,13 @@ export abstract class ProxyService {
 	}
 
 	/**
-	 * Resolves the identity for one conversation: session id, user-agent and
-	 * client tag. Any signal left unset falls back to a per-conversation
-	 * fingerprint so users stop sharing one constant UA/client/session prefix.
+	 * Resolves the identity for one conversation: session id, project id,
+	 * user-agent and client tag.
+	 *
+	 * A pinned USER_AGENT and a pinned CLIENT are kept consistent with each
+	 * other, and a caller that already sends an OpenCode user-agent keeps it —
+	 * with the client tag read back out of it, so the pair can never disagree.
+	 * Everything left unset falls back to the per-conversation fingerprint.
 	 */
 	static identity(
 		headers: Record<string, string | undefined>,
@@ -99,21 +112,41 @@ export abstract class ProxyService {
 		const seed = conversationSeedOf(headers, rawBody);
 		const fingerprint = fingerprintFor(seed);
 
-		const prefix = config.rotateSessionPrefix
-			? sessionPrefixFor(config.sessionCounter)
-			: (config.sessionPrefix ?? sessionPrefixFor(config.sessionCounter));
+		const callerAgent = (headers["user-agent"] ?? "").trim();
+		const callerClient = /^opencode\//.test(callerAgent)
+			? clientFromUserAgent(callerAgent)
+			: undefined;
+		const client =
+			config.client ??
+			clientFromUserAgent(config.userAgent) ??
+			callerClient ??
+			fingerprint.client;
+
+		const mode = sessionModeOf(config);
+		const prefix =
+			mode === "fixed"
+				? (config.sessionPrefix as string)
+				: mode === "per-request"
+					? sessionPrefixFor(config.sessionCounter)
+					: conversationPrefixFor(
+							fingerprint.sessionSuffix,
+							config.sessionCounter,
+						);
 
 		return {
 			seed,
 			session: sessionFor(prefix, fingerprint.sessionSuffix),
-			userAgent: config.userAgent ?? fingerprint.userAgent,
-			client: config.client ?? fingerprint.client,
+			project: projectFor(fingerprint.sessionSuffix),
+			userAgent:
+				config.userAgent ??
+				(callerClient ? callerAgent : userAgentFor(fingerprint.version, client)),
+			client,
 		};
 	}
 
 	/**
- * Forwards a request to the upstream, injecting a structurally valid
-	 * `x-opencode-session` header plus OpenCode client fallbacks.
+	 * Forwards a request to the upstream, injecting the identity headers an
+	 * OpenCode client sends plus a canonical request path.
 	 *
 	 * Returns the upstream Response untouched (minus hop-by-hop and
 	 * content-encoding headers) so status, streaming, and SSE all pass
@@ -153,29 +186,40 @@ export abstract class ProxyService {
 			config,
 		);
 		const { session } = identity;
+		// Spell the session the way the OpenCode client spells it:
+		// `x-opencode-session` and `x-session-affinity` carry the session
+		// affinity used for routing and prompt-cache keys, `x-opencode-session-id`
+		// carries the session itself, and `X-Session-Id` mirrors it for the
+		// providers that read that name.
 		headers.set("x-opencode-session", session);
+		headers.set("x-opencode-session-id", session);
+		headers.set("x-session-affinity", session);
+		headers.set("X-Session-Id", session);
 		headers.set("x-opencode-client", identity.client);
+		// Project ids belong to the caller (a git root commit, `host/path`, or
+		// `"global"`), so only supply one when the caller sent none.
+		if (!headers.has("x-opencode-project"))
+			headers.set("x-opencode-project", identity.project);
 		if (!/^opencode\//.test(headers.get("user-agent") ?? ""))
 			headers.set("user-agent", identity.userAgent);
 
+		const url = new URL(request.url);
+		const target = canonicalPath(url.pathname, config.canonicalizePaths);
 		const hop = egress.pick(identity.seed);
 		if (config.verbose)
 			console.log(
-				`${request.method} ${new URL(request.url).pathname} -> ${session} via ${hop?.label ?? hop?.url ?? "direct"}`,
+				`${request.method} ${url.pathname}${target.rewrittenFrom ? ` -> ${target.path}` : ""} -> ${session} via ${hop?.label ?? hop?.url ?? "direct"}`,
 			);
 
 		let upstream: Response;
 		try {
-			upstream = await fetch(
-				config.upstream + new URL(request.url).pathname + new URL(request.url).search,
-				{
-					method: request.method,
-					headers,
-					body: rawBody,
-					redirect: "manual",
-					...(hop ? { proxy: hop.url } : {}),
-				},
-			);
+			upstream = await fetch(config.upstream + target.path + url.search, {
+				method: request.method,
+				headers,
+				body: rawBody,
+				redirect: "manual",
+				...(hop ? { proxy: hop.url } : {}),
+			});
 		} catch (error) {
 			const message = `session proxy: upstream unreachable: ${(error as Error).message}`;
 			throw status(502, message satisfies ProxyModel["upstreamUnreachable"]);
@@ -194,4 +238,3 @@ export abstract class ProxyService {
 		});
 	}
 }
-

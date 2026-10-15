@@ -28,6 +28,9 @@ export const ProxyModel = {
 		),
 		USER_AGENT: t.Optional(t.String()),
 		CLIENT: t.Optional(t.String()),
+		CANONICALIZE_PATHS: t.Optional(
+			t.String({ pattern: "^(1|0|true|false)$" }),
+		),
 		VERBOSE: t.Optional(t.String({ pattern: "^(1|0|true|false)$" })),
 	}),
 
@@ -56,6 +59,8 @@ export const ProxyModel = {
 			}),
 		),
 		egressStrategy: t.String({ pattern: "^(stable|round-robin|random)$" }),
+		/** Rewrite legacy family-less inference paths onto their family. */
+		canonicalizePaths: t.Boolean(),
 		verbose: t.Boolean(),
 	}),
 
