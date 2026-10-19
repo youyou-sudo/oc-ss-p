@@ -1,15 +1,35 @@
 import { Elysia } from "elysia";
 
 import { ProxyService } from "./service";
-import { EgressSelector } from "../../utils/egress";
+import { EgressSelector, type EgressPicker } from "../../utils/egress";
+import { NodePool } from "../../utils/nodepool";
 import { sessionModeOf } from "../../utils/session";
 
 // Controller: one Elysia instance routes and validates HTTP concerns only.
 const config = ProxyService.config();
-const egress = new EgressSelector({
+
+// The static pool is always built: it is the fallback when xc-p is down,
+// empty, or fully rate limited, and a curated PROXIES list still beats
+// quietly going out from this host's own IP.
+const staticPool = new EgressSelector({
 	proxies: config.proxies,
 	strategy: config.egressStrategy as "stable" | "round-robin" | "random",
 });
+
+/** The xc-p-backed pool, present only when XCP_HOST is set. */
+const nodePool = config.xcp
+	? new NodePool({
+			host: config.xcp.host,
+			apiKey: config.xcp.apiKey,
+			refreshMs: config.xcp.refreshMs,
+			statePath: config.xcp.statePath,
+			resetHour: config.xcp.resetHour,
+			fallback: config.proxies.length > 0 ? staticPool : undefined,
+		})
+	: undefined;
+nodePool?.start();
+
+const egress: EgressPicker = nodePool ?? staticPool;
 
 /** Validated config, exposed for the server entrypoint. */
 export const proxyConfig = config;
@@ -38,6 +58,9 @@ export const proxy = new Elysia()
 		egress: {
 			proxies: config.proxies.length,
 			strategy: config.egressStrategy,
+			// Live sticky-pool state: which node is in use, how many are left,
+			// and which IPs are burned until the next 08:00 reset.
+			...(nodePool ? { xcp: nodePool.status() } : {}),
 		},
 		fingerprint: {
 			userAgent: config.userAgent ?? "per-conversation",

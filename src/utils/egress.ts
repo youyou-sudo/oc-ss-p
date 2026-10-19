@@ -15,6 +15,18 @@ export interface EgressProxy {
 	url: string;
 	/** Label for logs. Defaults to the URL. */
 	label?: string;
+	/**
+	 * Stable identity of the node behind this hop, used to remember which
+	 * nodes opencode has rate limited. Only a dynamic pool sets it; static
+	 * entries fall back to their URL.
+	 */
+	key?: string;
+	/**
+	 * Exit IP the node presents, when the pool's control plane has measured
+	 * it. A rate limit is per exit IP, so this is what lets the pool avoid an
+	 * IP even after it comes back under a different node.
+	 */
+	ip?: string;
 }
 
 export type EgressStrategy = "stable" | "round-robin" | "random";
@@ -22,6 +34,37 @@ export type EgressStrategy = "stable" | "round-robin" | "random";
 export interface EgressPool {
 	proxies: EgressProxy[];
 	strategy: EgressStrategy;
+}
+
+/**
+ * Feedback about a request, so a dynamic pool can react to a hop that just
+ * failed. Both variants are reported only after `fetch` has returned (or
+ * thrown): the request itself is never replayed here.
+ */
+export type EgressEvent =
+	/**
+	 * The upstream answered 429. opencode limits the *exit IP*, not the hop,
+	 * so the pool should retire the node for the rest of the day.
+	 */
+	| { type: "rate-limited"; status: number }
+	/** The hop could not be reached at all (connect refused, TLS, timeout). */
+	| { type: "unreachable"; error: string };
+
+/**
+ * Chooses the hop a request goes out through.
+ *
+ * `report` is optional: a static list has nothing to learn from a failure
+ * and simply leaves it unimplemented, which also means the service never
+ * retries a request for it.
+ */
+export interface EgressPicker {
+	/** Returns the hop for this conversation seed, or undefined for direct. */
+	pick(seed: string): EgressProxy | undefined;
+	/**
+	 * Tells the picker how a request ended. Returns true when it moved to a
+	 * *different* hop, which is what makes a retry worth attempting.
+	 */
+	report?(proxy: EgressProxy | undefined, event: EgressEvent): boolean;
 }
 
 /**
@@ -51,7 +94,7 @@ export function parseProxies(raw: string): EgressProxy[] {
  * Picks a proxy for a conversation seed. Returns undefined when the pool is
  * empty, which means "connect directly".
  */
-export class EgressSelector {
+export class EgressSelector implements EgressPicker {
 	private cursor = 0;
 
 	constructor(private readonly pool: EgressPool) {}

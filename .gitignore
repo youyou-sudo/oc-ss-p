@@ -17,6 +17,9 @@
 /dist
 /.bun-cache
 
+# runtime state (the daily rate-limit record lives here)
+/.oc-ss-p
+
 # misc
 .DS_Store
 *.pem

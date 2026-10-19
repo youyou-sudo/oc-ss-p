@@ -32,6 +32,14 @@ export const ProxyModel = {
 			t.String({ pattern: "^(1|0|true|false)$" }),
 		),
 		VERBOSE: t.Optional(t.String({ pattern: "^(1|0|true|false)$" })),
+		/** xc-p panel / service API base, e.g. http://127.0.0.1:8080. */
+		XCP_HOST: t.Optional(t.String({ format: "uri" })),
+		/** Service API key (`read` + `credentials` scopes). */
+		XCP_API_KEY: t.Optional(t.String()),
+		XCP_REFRESH_MS: t.Optional(t.String({ pattern: "^[0-9]+$" })),
+		XCP_RETRIES: t.Optional(t.String({ pattern: "^[0-9]+$" })),
+		XCP_STATE: t.Optional(t.String()),
+		XCP_RESET_HOUR: t.Optional(t.String({ pattern: "^[0-9]+$" })),
 	}),
 
 	/** Parsed, typed configuration used by the service. */
@@ -60,6 +68,26 @@ export const ProxyModel = {
 			}),
 		),
 		egressStrategy: t.String({ pattern: "^(stable|round-robin|random)$" }),
+		/**
+		 * xc-p node pool, or null when XCP_HOST is unset. When set it
+		 * replaces the static pool as the source of egress hops.
+		 */
+		xcp: t.Union([
+			t.Object({
+				host: t.String({ format: "uri" }),
+				/** Service API key; empty only for a control plane without auth. */
+				apiKey: t.String(),
+				/** How often the node list is re-read. */
+				refreshMs: t.Integer({ minimum: 10_000 }),
+				/** File holding the daily rate-limit record. */
+				statePath: t.String(),
+				/** Hour the record rolls over. */
+				resetHour: t.Integer({ minimum: 0, maximum: 23 }),
+			}),
+			t.Null(),
+		]),
+		/** Extra attempts after a 429 or an unreachable hop (0 disables). */
+		egressRetries: t.Integer({ minimum: 0, maximum: 5 }),
 		/** Rewrite legacy family-less inference paths onto their family. */
 		canonicalizePaths: t.Boolean(),
 		verbose: t.Boolean(),

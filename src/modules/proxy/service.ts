@@ -9,7 +9,7 @@ import {
 	sessionFor,
 	sessionModeOf,
 } from "../../utils/session";
-import { EgressSelector, parseProxies } from "../../utils/egress";
+import { parseProxies, type EgressPicker } from "../../utils/egress";
 import {
 	clientFromUserAgent,
 	fingerprintFor,
@@ -26,6 +26,11 @@ import {
 	ZEN_TOOL_STUB_DESCRIPTION,
 	ZEN_TOOLS,
 } from "../../utils/zen";
+
+/** Node list is re-read every 6 minutes unless XCP_REFRESH_MS says otherwise. */
+const DEFAULT_REFRESH_MS = 6 * 60 * 1000;
+/** Daily rate-limit record; relative paths resolve against the working directory. */
+const DEFAULT_STATE_PATH = ".oc-ss-p/rate-limited.json";
 
 /** Per-conversation identity chosen for one request. */
 interface Identity {
@@ -58,6 +63,12 @@ export abstract class ProxyService {
 			"CLIENT",
 			"CANONICALIZE_PATHS",
 			"VERBOSE",
+			"XCP_HOST",
+			"XCP_API_KEY",
+			"XCP_REFRESH_MS",
+			"XCP_RETRIES",
+			"XCP_STATE",
+			"XCP_RESET_HOUR",
 		] as const) {
 			const value = env[key];
 			if (value !== undefined && value !== "") raw[key] = value;
@@ -87,6 +98,18 @@ export abstract class ProxyService {
 			client: raw.CLIENT ?? null,
 			proxies: raw.PROXIES ? parseProxies(raw.PROXIES) : [],
 			egressStrategy: raw.EGRESS_STRATEGY ?? "stable",
+			// Opt-in: an install that never sets XCP_HOST behaves exactly as
+			// before, static PROXIES or direct.
+			xcp: raw.XCP_HOST
+				? {
+						host: raw.XCP_HOST.replace(/\/+$/, ""),
+						apiKey: raw.XCP_API_KEY ?? "",
+						refreshMs: Number(raw.XCP_REFRESH_MS ?? DEFAULT_REFRESH_MS),
+						statePath: raw.XCP_STATE ?? DEFAULT_STATE_PATH,
+						resetHour: Number(raw.XCP_RESET_HOUR ?? 8),
+					}
+				: null,
+			egressRetries: Number(raw.XCP_RETRIES ?? 1),
 			// On by default: it is a no-op for callers that already send a
 			// family-scoped path, and it keeps legacy callers working.
 			canonicalizePaths:
@@ -173,7 +196,7 @@ export abstract class ProxyService {
 	static async forward(
 		request: Request,
 		config: ProxyModel["config"],
-		egress: EgressSelector,
+		egress: EgressPicker,
 	): Promise<Response> {
 		const hasBody =
 			request.method !== "GET" && request.method !== "HEAD";
@@ -244,26 +267,56 @@ export abstract class ProxyService {
 			path: zen.path,
 			rewrittenFrom: zen.rewrittenFrom ?? canonical.rewrittenFrom,
 		};
-		const hop = egress.pick(identity.seed);
-		if (config.verbose)
-			console.log(
-				`${request.method} ${url.pathname}${target.rewrittenFrom ? ` -> ${target.path}` : ""} -> ${session} via ${hop?.label ?? hop?.url ?? "direct"}${free ? " (zen free)" : ""}`,
-			);
+		const payload = hasBody
+			? Buffer.from(free ? zenFreeRequestBody(bodyText) : bodyText, "utf8")
+			: undefined;
 
+		// A 429 or a dead hop is reported back to the picker, which retires
+		// that node and moves to another one. Neither failure ever reached
+		// opencode, so replaying the request is free of side effects; the
+		// retry budget is what keeps a fully rate-limited pool from looping.
+		const attempts = 1 + config.egressRetries;
 		let upstream: Response;
-		try {
-			upstream = await fetch(config.upstream + target.path + url.search, {
-				method: request.method,
-				headers,
-				body: hasBody
-					? Buffer.from(free ? zenFreeRequestBody(bodyText) : bodyText, "utf8")
-					: undefined,
-				redirect: "manual",
-				...(hop ? { proxy: hop.url } : {}),
-			});
-		} catch (error) {
-			const message = `session proxy: upstream unreachable: ${(error as Error).message}`;
-			throw status(502, message satisfies ProxyModel["upstreamUnreachable"]);
+		for (let attempt = 0; ; attempt++) {
+			const hop = egress.pick(identity.seed);
+			if (config.verbose)
+				console.log(
+					`${request.method} ${url.pathname}${target.rewrittenFrom ? ` -> ${target.path}` : ""} -> ${session} via ${hop?.label ?? hop?.url ?? "direct"}${free ? " (zen free)" : ""}${attempt > 0 ? ` (attempt ${attempt + 1})` : ""}`,
+				);
+
+			try {
+				upstream = await fetch(config.upstream + target.path + url.search, {
+					method: request.method,
+					headers,
+					body: payload,
+					redirect: "manual",
+					...(hop ? { proxy: hop.url } : {}),
+				});
+			} catch (error) {
+				// A node that cannot carry the request shows up here, not as a
+				// status code: an https upstream tunnels through CONNECT, and a
+				// hop that cannot reach it either refuses the tunnel (407/502)
+				// or accepts it and then drops the socket — Bun throws either
+				// way, which is why the pool keys on the throw. An http
+				// upstream would instead forward the hop's bare 5xx.
+				const message = (error as Error).message;
+				const switched =
+					egress.report?.(hop, { type: "unreachable", error: message }) ?? false;
+				if (switched && attempt < attempts - 1) continue;
+				throw status(
+					502,
+					`session proxy: upstream unreachable: ${message}` satisfies ProxyModel["upstreamUnreachable"],
+				);
+			}
+
+			if (upstream.status !== 429) break;
+			// opencode limits the exit IP, not this proxy: retire the node for
+			// the rest of the day and try once more from another one.
+			const switched =
+				egress.report?.(hop, { type: "rate-limited", status: upstream.status }) ??
+				false;
+			if (!switched || attempt >= attempts - 1) break;
+			await upstream.body?.cancel().catch(() => {});
 		}
 
 		const responseHeaders = new Headers(upstream.headers);

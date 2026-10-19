@@ -56,6 +56,12 @@ https://opencode.ai/inference  ->  http://127.0.0.1:8787/inference
 | `UPSTREAM`               | `https://opencode.ai`  | 上游 base URL                            |
 | `PROXIES`                | _(空)_                 | 出口代理池，见下文                       |
 | `EGRESS_STRATEGY`        | `stable`               | `stable` / `round-robin` / `random`      |
+| `XCP_HOST`               | _(空)_                 | xc-p 控制面地址；设置后用它节点池做出站  |
+| `XCP_API_KEY`            | _(空)_                 | 服务 API Key（scope：`read` + `credentials`） |
+| `XCP_REFRESH_MS`         | `360000`               | 节点列表刷新间隔（6 分钟）               |
+| `XCP_RETRIES`            | `1`                    | 429 / 节点故障后的换节点重试次数（0..5） |
+| `XCP_STATE`              | `.oc-ss-p/rate-limited.json` | 当日限流记录（JSON）              |
+| `XCP_RESET_HOUR`         | `8`                    | 限流记录清空时刻（本地时间）             |
 | `SESSION_PREFIX`         | _(按会话铸造)_         | 固定 12 位 hex 前缀（旧默认 `ses_ecbe61115ffe`） |
 | `ROTATE_SESSION_PREFIX`  | `false`                | 为每次请求铸造新前缀（建议别开）         |
 | `SESSION_COUNTER`        | `1`                    | 前缀内嵌的 counter（12 位，1..4095）     |
@@ -130,6 +136,54 @@ PROXIES="http://user:pass@host1:8080#alpha,http://user:pass@host2:8080#beta"
 
 `https://` 上游通过 `CONNECT` 隧道穿过代理。
 
+### xc-p 节点池
+
+维护 `PROXIES` 要手工改环境变量。如果本机（或内网）跑着 **xc-p**（Xray 节点池面板），
+把它的控制面地址和一枚服务 API Key 填进来，出站就直接用它检测过的节点池：
+
+```bash
+XCP_HOST=http://127.0.0.1:8080
+XCP_API_KEY=<面板「API Keys」里创建的 key>
+```
+
+Key 要勾 `read` 与 `credentials` 两个 scope：节点列表走 `GET /v1/nodes`，凭据走
+`GET /v1/endpoints`，网关端口走 `GET /v1/gateway`；`/v1` 认的是
+`Authorization: Bearer <key>`，不需要管理员会话。
+
+**xc-p 把整个池子挂在同一个网关端口上**，靠**代理用户名选节点**
+（用户名 = 节点 ID，密码 = 该节点凭据），所以每一跳都是
+`http://<节点用户名>:<密码>@<XCP_HOST 的主机>:<网关端口>`。主机取 `XCP_HOST`
+的主机名（而不是 `/v1/gateway` 里的 `host`——那是面板展示用的 `panel.baseUrl`，
+在这里不一定能解析）。
+
+行为：
+
+- **按状态选**：`GET /v1/nodes` 返回 xc-p 检测状态机的结论
+  （`up` / `degraded` / `down` / `quarantined` / `unknown`）。排序是
+  `up` → `degraded` → `unknown`，同档按实测 `delayMs` 升序；`down` 与
+  `quarantined` 永远不会被选中，`unknown`（刚导入还没测过）留作兜底。
+- **每 6 分钟**重新拉一次列表（`XCP_REFRESH_MS`）。刷新失败时保留上一份列表，
+  不会一次性丢掉所有出口。
+- **选中一个节点后一直用它**，不按对话轮换：出口 IP 只在被限流或节点失效时才变。
+- **出现 429 或节点不可达**时，退役该节点、切换到下一个可用节点，并把当前请求重试
+  一次（`XCP_RETRIES`）。两种情况都没有真的打到 opencode，重放请求没有副作用。
+- **当天已被限流的出口 IP 不再使用**：记录写进 `XCP_STATE`（默认
+  `.oc-ss-p/rate-limited.json`），纯 JSON，不引入任何依赖。
+- **每天 8 点后清空限流记录**（`XCP_RESET_HOUR`）：一天从 08:00 到次日 08:00，
+  早于当前这一天起点的记录会在下次读取时被丢掉 —— 不需要任何定时任务，进程睡过去了、
+  重启了，都不会漏掉这次清零。
+- 节点池为空或全部退役时，回退到 `PROXIES`（如果配了），否则直连。
+- `GET /` 会返回节点池实时状态（当前节点及其状态/出口 IP、各状态节点数、今日已限流数量）。
+
+> 记录以节点 ID 为键，同时记下当时的**出口 IP**（`/v1/nodes` 的 `status.exitIp`，
+> 由 xc-p 检测的第三步确认）。于是同一个出口换了个节点 ID 回来，或者两个节点共用
+> 同一个出口 IP，都会被认成"今天已经限流过的 IP"而跳过。
+
+> 网关自己也会回 `429`（并发上限 `gateway.maxConcurrentPerUser` /
+> `maxConcurrentPerIp`），但那是 **CONNECT 阶段的应答**：https 上游会因此让
+> `fetch` 抛错，走的是"节点不可达"分支，不会被误判成 opencode 的限流。真正作为
+> `429` 响应回给本代理的，只有 opencode 自己的限流。
+
 ## 指纹
 
 早期所有用户共用同一个 session 前缀、同一个 UA、同一个 client 标签——这比共用
@@ -181,7 +235,10 @@ src
     session.ts     session 铸造辅助（前缀铸造 + 缓存）
     fingerprint.ts 按会话成对派生 UA/client、后缀与 project id
     upstream.ts    旧推理路径 -> 带 API family 的规范路径
-    egress.ts      出口代理池与选择策略
+    egress.ts      静态出口池、选择策略与 EgressPicker 接口
+    xcp.ts         xc-p 服务 API 客户端（/v1 节点、凭据、网关）与状态排序
+    nodepool.ts    xc-p 节点池（按状态粘性选节点 + 429/故障切换）
+    ratelimit.ts   当日限流记录（JSON，8 点清零）
   index.ts         服务入口
 ```
 
@@ -204,7 +261,11 @@ src
 
 - **不支持 SOCKS5。** Bun 的 `fetch` 硬性拒绝 `socks5://` / `socks5h://`。要支持
   需更换 HTTP 客户端实现，或改走 `curl --socks5-hostname` 子进程。
-- **无代理健康检查与熔断。** 失效代理会直接返回 502。
+- **静态 `PROXIES` 池没有健康检查与熔断。** 失效代理会直接返回 502。
+  `XCP_HOST` 节点池则带健康处理：选节点时用 xc-p 的检测状态，运行时 429 与不可达
+  都会换节点并重试一次。（注意 `https://` 上游走 CONNECT 隧道，节点不可达会表现为
+  `fetch` 抛错；若把 `UPSTREAM` 设成 http，代理网关会把这类失败当成裸 5xx 响应
+  转发，节点池看不到——保持 `UPSTREAM` 为 https 即可。）
 - **免费层的服务端风控无法用配置绕过。** 2026-10-14 之后，
   opencode 新的 inference 服务接管了鉴权、模型可用性与免费层准入，判定依据是
   客户端行为（工具清单、agent 形态、登录态）而不是单个请求头。本代理能修正

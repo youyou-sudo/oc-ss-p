@@ -38,11 +38,27 @@ const app = new Elysia()
 console.log(
 	`🦊 opencode-session-proxy on http://${app.server?.hostname}:${app.server?.port} -> ${proxyConfig.upstream}`,
 );
-if (proxyConfig.proxies.length > 0)
+if (proxyConfig.xcp) {
+	const pool = proxyConfig.xcp;
+	console.log(
+		`   egress via xc-p at ${pool.host} (sticky node by status, list every ${Math.round(pool.refreshMs / 1000)}s, rate-limit reset ${pool.resetHour}:00)`,
+	);
+	if (proxyConfig.proxies.length > 0)
+		console.log(
+			`   fallback: ${proxyConfig.proxies.length} static prox${proxyConfig.proxies.length === 1 ? "y" : "ies"} (${proxyConfig.egressStrategy})`,
+		);
+	if (!pool.apiKey)
+		console.warn(
+			"   warning: XCP_API_KEY is empty — xc-p's /v1 requires a service API key with the read and credentials scopes, so the pool will 401 and egress falls back until it is set",
+		);
+} else if (proxyConfig.proxies.length > 0)
 	console.log(
 		`   egress via ${proxyConfig.proxies.length} prox${proxyConfig.proxies.length === 1 ? "y" : "ies"} (${proxyConfig.egressStrategy})`,
 	);
-else console.log("   egress direct (set PROXIES to route through an upstream proxy)");
+else
+	console.log(
+		"   egress direct (set PROXIES or XCP_HOST to route through an upstream proxy)",
+	);
 if (!proxyConfig.userAgent || !proxyConfig.client)
 	console.log("   fingerprint: per-conversation user-agent + client tag");
 const sessionMode = sessionModeOf(proxyConfig);
